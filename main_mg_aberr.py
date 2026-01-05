@@ -1,107 +1,87 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Mg I abundance-correction tool
+Input: CSV or XLSX file
+Output: CSV file with abundance correction (aberr)
+
+Usage:
+    python3 main_mg_aberr.py input_file output_file
+"""
 
 import sys
-import numpy as np
-import pandas as pd
-import joblib
 from pathlib import Path
+import pandas as pd
+import numpy as np
+import joblib
 
-# =========================
-# Model paths
-# =========================
-UNIFIED_MODEL = Path("models/unified_mlp_pipeline.joblib")
-MODEL_457 = Path("models/mlp_pipeline_457nm_aberr.joblib")
+# -------------------------------------------------
+# Load trained models
+# -------------------------------------------------
+MODEL_DIR = Path("models")
+MODEL_457 = MODEL_DIR / "mlp_pipeline_457nm_aberr.joblib"
+MODEL_MULTI = MODEL_DIR / "mlp_pipeline_multiline_aberr.joblib"
 
-# =========================
-# Constants
-# =========================
-TARGET_457 = 457.1
-TOL_457 = 0.2
-HC_eVnm = 1239.841984
+model_457 = joblib.load(MODEL_457)
+model_multi = joblib.load(MODEL_MULTI)
 
-LINE_PHYSICS = {
-    416.73: dict(elo_eV=4.3458, lggf=-0.746, log_gamma_rad=8.69, sigma=5296.0, alpha=0.508),
-    470.30: dict(elo_eV=4.3458, lggf=-0.456, log_gamma_rad=8.70, sigma=2827.0, alpha=0.264),
-    473.00: dict(elo_eV=4.3458, lggf=-2.379, log_gamma_rad=8.68, sigma=5928.0, alpha=0.435),
-    516.73: dict(elo_eV=2.7091, lggf=-0.854, log_gamma_rad=8.02, sigma=731.0,  alpha=0.240),
-    571.11: dict(elo_eV=4.3458, lggf=-1.742, log_gamma_rad=8.69, sigma=1841.0, alpha=0.120),
-}
-
-# =========================
+# -------------------------------------------------
 # Helpers
-# =========================
-def nearest_line(lam):
-    arr = np.array(list(LINE_PHYSICS.keys()))
-    return float(arr[np.argmin(np.abs(arr - lam))])
+# -------------------------------------------------
+def load_input_table(fname: str) -> pd.DataFrame:
+    """Load CSV or XLSX input file"""
+    if fname.lower().endswith(".xlsx"):
+        df = pd.read_excel(fname)
+    elif fname.lower().endswith(".csv"):
+        df = pd.read_csv(fname)
+    else:
+        raise ValueError("Input file must be .csv or .xlsx")
+    return df
 
-def n_air_ciddor(lam_air_nm):
-    lam_um = lam_air_nm / 1000.0
-    s = 1.0 / lam_um
-    n_minus_1 = 1e-8 * (5792105.0/(238.0185 - s**2) + 167917.0/(57.362 - s**2))
-    return 1.0 + n_minus_1
 
-# =========================
-# Main routine
-# =========================
-def main(infile, outfile):
-    df = pd.read_csv(infile)
-
-    required = {"Teff", "logg", "A(Mg)", "vmic", "lambda"}
+def validate_columns(df: pd.DataFrame):
+    required = {"Teff", "logg", "A(Mg)", "vmic", "line"}
     missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"Missing columns: {', '.join(missing)}")
+        raise KeyError(f"Missing required columns: {missing}")
 
-    out = df.copy()
-    out["aberr"] = np.nan
-    out["model_used"] = ""
 
-    # --- 457 nm model ---
-    mask_457 = abs(out["lambda"] - TARGET_457) <= TOL_457
+# -------------------------------------------------
+# Main logic
+# -------------------------------------------------
+def main(infile: str, outfile: str):
+
+    df = load_input_table(infile)
+    validate_columns(df)
+
+    X = df[["Teff", "logg", "A(Mg)", "vmic"]].apply(pd.to_numeric, errors="coerce")
+    line = pd.to_numeric(df["line"], errors="coerce")
+
+    aberr = np.zeros(len(df))
+
+    # Dedicated 457.1 nm model
+    mask_457 = np.isclose(line, 457.1, atol=0.2)
     if mask_457.any():
-        model_457 = joblib.load(MODEL_457)
-        X_457 = out.loc[mask_457, ["Teff", "logg", "A(Mg)", "vmic"]]
-        out.loc[mask_457, "aberr"] = model_457.predict(X_457)
-        out.loc[mask_457, "model_used"] = "457nm"
+        aberr[mask_457] = model_457.predict(X.loc[mask_457])
 
-    # --- Unified model ---
-    mask_uni = ~mask_457
-    if mask_uni.any():
-        model_uni = joblib.load(UNIFIED_MODEL)
+    # Multiline model
+    mask_other = ~mask_457
+    if mask_other.any():
+        aberr[mask_other] = model_multi.predict(
+            pd.concat([X.loc[mask_other], line.loc[mask_other]], axis=1)
+        )
 
-        lam_air = out.loc[mask_uni, "lambda"].apply(nearest_line).values
-        phys = pd.DataFrame([LINE_PHYSICS[l] for l in lam_air])
+    df["aberr"] = aberr
+    df.to_csv(outfile, index=False)
 
-        lam_vac = lam_air * n_air_ciddor(lam_air)
-        deltaE = HC_eVnm / lam_vac
-        eup = phys["elo_eV"].values + deltaE
+    print(f"Saved output → {outfile}")
 
-        X_uni = pd.DataFrame({
-            "Teff": out.loc[mask_uni, "Teff"],
-            "logg": out.loc[mask_uni, "logg"],
-            "A(Mg)": out.loc[mask_uni, "A(Mg)"],
-            "vmic": out.loc[mask_uni, "vmic"],
-            "lambda_air": lam_air,
-            "lambda_vac": lam_vac,
-            "deltaE_eV": deltaE,
-            "elo_eV": phys["elo_eV"],
-            "eup_eV": eup,
-            "lggf": phys["lggf"],
-            "log_gamma_rad": phys["log_gamma_rad"],
-            "sigma": phys["sigma"],
-            "alpha": phys["alpha"],
-        })
 
-        out.loc[mask_uni, "aberr"] = model_uni.predict(X_uni)
-        out.loc[mask_uni, "model_used"] = "unified"
-
-    out.to_csv(outfile, index=False)
-    print(f"Saved abundance corrections → {outfile}")
-
-# =========================
-
+# -------------------------------------------------
 if __name__ == "__main__":
     if len(sys.argv) != 3:
-        print("Usage: python3 main_mg_aberr.py input.csv output.csv")
+        print("Usage: python3 main_mg_aberr.py input_file output_file")
         sys.exit(1)
 
     main(sys.argv[1], sys.argv[2])
