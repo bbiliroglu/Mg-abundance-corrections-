@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """
-Mg I abundance corrections: 1D LTE – 3D NLTE
+Mg I abundance corrections (1D LTE − 3D NLTE)
 
 Usage:
     python3 main_mg_aberr.py input.csv output.csv
     python3 main_mg_aberr.py input.xlsx output.csv
 
-Input columns (required):
+Input columns:
     Teff, logg, A(Mg), vmic, line
-
-Output:
-    Same table + column:
-        aberr  (dex)
 """
 
 import sys
@@ -21,107 +17,133 @@ import pandas as pd
 import joblib
 
 
-# ---------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------
+# --------------------------------------------------
+# Paths
+# --------------------------------------------------
 
 MODELS_DIR = "models"
-
 MODEL_457 = os.path.join(MODELS_DIR, "mlp_pipeline_457nm_aberr.joblib")
 MODEL_UNIFIED = os.path.join(MODELS_DIR, "unified_mlp_pipeline.joblib")
 
-SUPPORTED_LINES = np.array([416.7, 457.1, 470.3, 473.0, 516.7, 571.1])
+
+# --------------------------------------------------
+# Line-physics table (INTERNAL)
+# --------------------------------------------------
+
+LINE_PHYSICS = {
+    416.7: dict(lambda_vac=416.8, elo_eV=2.71, eup_eV=5.69,
+                deltaE_eV=2.98, lggf=-0.71, log_gamma_rad=8.52,
+                sigma=281.0, alpha=0.23),
+
+    470.3: dict(lambda_vac=470.4, elo_eV=4.35, eup_eV=6.99,
+                deltaE_eV=2.64, lggf=-0.44, log_gamma_rad=8.38,
+                sigma=327.0, alpha=0.24),
+
+    473.0: dict(lambda_vac=473.1, elo_eV=4.35, eup_eV=6.97,
+                deltaE_eV=2.62, lggf=-2.39, log_gamma_rad=8.38,
+                sigma=327.0, alpha=0.24),
+
+    516.7: dict(lambda_vac=516.8, elo_eV=2.71, eup_eV=5.11,
+                deltaE_eV=2.40, lggf=-0.87, log_gamma_rad=8.49,
+                sigma=281.0, alpha=0.23),
+
+    571.1: dict(lambda_vac=571.2, elo_eV=4.35, eup_eV=6.52,
+                deltaE_eV=2.17, lggf=-1.83, log_gamma_rad=8.42,
+                sigma=327.0, alpha=0.24),
+}
 
 
-# ---------------------------------------------------------
+# --------------------------------------------------
 # Helpers
-# ---------------------------------------------------------
+# --------------------------------------------------
 
 def read_input(fname):
     if fname.lower().endswith(".csv"):
         return pd.read_csv(fname)
-    elif fname.lower().endswith((".xlsx", ".xls")):
+    if fname.lower().endswith((".xlsx", ".xls")):
         return pd.read_excel(fname)
-    else:
-        raise ValueError("Input file must be .csv or .xlsx")
+    raise ValueError("Input file must be CSV or XLSX")
 
 
 def parse_line(val):
-    """
-    Parse wavelength column.
-    Accepts:
-        457.1
-        "457.1"
-        "457.1 nm"
-    """
     if pd.isna(val):
         return np.nan
     if isinstance(val, (int, float)):
         return float(val)
-    s = str(val).lower().replace("nm", "").strip()
-    return float(s)
+    return float(str(val).lower().replace("nm", "").strip())
 
 
-# ---------------------------------------------------------
+# --------------------------------------------------
 # Main
-# ---------------------------------------------------------
+# --------------------------------------------------
 
 def main(infile, outfile):
 
     df = read_input(infile)
 
     required = ["Teff", "logg", "A(Mg)", "vmic", "line"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
+    for c in required:
+        if c not in df.columns:
+            raise ValueError(f"Missing required column: {c}")
 
-    # Parse wavelength column
     df["lambda_air"] = df["line"].map(parse_line).round(1)
 
-    # Drop unsupported lines
-    mask_supported = np.isin(df["lambda_air"], SUPPORTED_LINES)
-
-    if not mask_supported.all():
-        dropped = np.sort(df.loc[~mask_supported, "lambda_air"].unique())
-        print(f"Warning: dropping unsupported Mg I lines (nm): {dropped}")
-
-    df = df.loc[mask_supported].reset_index(drop=True)
-
-    if df.empty:
-        raise ValueError("No supported Mg I lines left after filtering.")
-
-    # Prepare output column
+    # Prepare output
     df["aberr"] = np.nan
 
     # Load models
     model_457 = joblib.load(MODEL_457)
-    model_unified = joblib.load(MODEL_UNIFIED)
+    model_uni = joblib.load(MODEL_UNIFIED)
 
-    # Features used by ML models
-    Xcols = ["Teff", "logg", "A(Mg)", "vmic"]
-
-    # 457.1 nm (dedicated model)
+    # -------------------------
+    # 457.1 nm
+    # -------------------------
     mask_457 = df["lambda_air"] == 457.1
     if mask_457.any():
-        X = df.loc[mask_457, Xcols]
+        X = df.loc[mask_457, ["Teff", "logg", "A(Mg)", "vmic"]]
         df.loc[mask_457, "aberr"] = model_457.predict(X)
 
-    # Other supported lines (unified model)
-    mask_other = ~mask_457
-    if mask_other.any():
-        X = df.loc[mask_other, Xcols].copy()
-        X["lambda_air"] = df.loc[mask_other, "lambda_air"].values
-        df.loc[mask_other, "aberr"] = model_unified.predict(X)
+    # -------------------------
+    # Unified model
+    # -------------------------
+    mask_uni = df["lambda_air"].isin(LINE_PHYSICS.keys())
+    mask_uni &= ~mask_457
 
-    # Save output
-    df.drop(columns=["lambda_air"]).to_csv(outfile, index=False)
-    print(f"Saved abundance corrections to {outfile}")
+    if mask_uni.any():
+        rows = df.loc[mask_uni].copy()
+
+        for col in ["lambda_vac", "elo_eV", "eup_eV", "deltaE_eV",
+                    "lggf", "log_gamma_rad", "sigma", "alpha"]:
+            rows[col] = rows["lambda_air"].map(
+                lambda l: LINE_PHYSICS[l][col]
+            )
+
+        X = rows[[
+            "Teff", "logg", "A(Mg)", "vmic",
+            "lambda_vac", "elo_eV", "eup_eV", "deltaE_eV",
+            "lggf", "log_gamma_rad", "sigma", "alpha"
+        ]]
+
+        df.loc[mask_uni, "aberr"] = model_uni.predict(X)
+
+    # -------------------------
+    # Warn & drop unsupported
+    # -------------------------
+    unsupported = df["aberr"].isna()
+    if unsupported.any():
+        bad = np.sort(df.loc[unsupported, "lambda_air"].unique())
+        print(f"Warning: unsupported Mg I lines dropped: {bad}")
+
+    df = df.loc[~unsupported].drop(columns="lambda_air")
+    df.to_csv(outfile, index=False)
+
+    print(f"Saved abundance corrections → {outfile}")
 
 
-# ---------------------------------------------------------
+# --------------------------------------------------
 if __name__ == "__main__":
     if len(sys.argv) != 3:
-        print("Usage: python3 main_mg_aberr.py input_file output_file")
+        print("Usage: python3 main_mg_aberr.py input output")
         sys.exit(1)
 
     main(sys.argv[1], sys.argv[2])
