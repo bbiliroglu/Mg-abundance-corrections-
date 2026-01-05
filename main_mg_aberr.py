@@ -1,164 +1,127 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-Mg I abundance correction tool
-
-Computes abundance corrections (1D LTE − 3D NLTE) using pre-trained
-machine-learning models.
+Mg I abundance corrections: 1D LTE – 3D NLTE
 
 Usage:
     python3 main_mg_aberr.py input.csv output.csv
     python3 main_mg_aberr.py input.xlsx output.csv
 
-Required input columns:
+Input columns (required):
     Teff, logg, A(Mg), vmic, line
+
+Output:
+    Same table + column:
+        aberr  (dex)
 """
 
 import sys
-import re
-from pathlib import Path
-
+import os
 import numpy as np
 import pandas as pd
 import joblib
 
-# =========================
-# Paths
-# =========================
-ROOT = Path(__file__).resolve().parent
-MODELS = ROOT / "models"
 
-MODEL_457 = MODELS / "mlp_pipeline_457nm_aberr.joblib"
-MODEL_UNIFIED = MODELS / "unified_mlp_pipeline.joblib"
+# ---------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------
 
-# =========================
-# Constants & line physics
-# =========================
-HC_eVnm = 1239.841984
+MODELS_DIR = "models"
 
-LINE_PHYSICS = {
-    416.7: dict(elo_eV=4.3458, lggf=-0.746, log_gamma_rad=8.69, sigma=5296.0, alpha=0.508),
-    457.1: dict(elo_eV=0.0000, lggf=-5.623, log_gamma_rad=7.77, sigma=1000.0, alpha=0.250),
-    470.3: dict(elo_eV=4.3458, lggf=-0.456, log_gamma_rad=8.70, sigma=2827.0, alpha=0.264),
-    473.0: dict(elo_eV=4.3458, lggf=-2.379, log_gamma_rad=8.68, sigma=5928.0, alpha=0.435),
-    516.7: dict(elo_eV=2.7091, lggf=-0.854, log_gamma_rad=8.02, sigma=731.0,  alpha=0.240),
-    571.1: dict(elo_eV=4.3458, lggf=-1.742, log_gamma_rad=8.69, sigma=1841.0, alpha=0.120),
-}
+MODEL_457 = os.path.join(MODELS_DIR, "mlp_pipeline_457nm_aberr.joblib")
+MODEL_UNIFIED = os.path.join(MODELS_DIR, "unified_mlp_pipeline.joblib")
 
-# =========================
+SUPPORTED_LINES = np.array([416.7, 457.1, 470.3, 473.0, 516.7, 571.1])
+
+
+# ---------------------------------------------------------
 # Helpers
-# =========================
-def parse_nm(val):
-    """Extract numeric wavelength (nm) from 'line' column."""
-    if pd.isna(val):
-        return np.nan
-    m = re.search(r"([0-9]+(?:\.[0-9]+)?)", str(val))
-    return float(m.group(1)) if m else np.nan
+# ---------------------------------------------------------
 
-
-def n_air_ciddor(lam_air_nm):
-    """Refractive index of dry air (Ciddor)."""
-    lam_um = lam_air_nm / 1000.0
-    s = 1.0 / lam_um
-    n_minus_1 = 1e-8 * (
-        5792105.0 / (238.0185 - s**2)
-        + 167917.0 / (57.362 - s**2)
-    )
-    return 1.0 + n_minus_1
-
-
-def read_input(path):
-    if path.suffix.lower() == ".csv":
-        return pd.read_csv(path)
-    elif path.suffix.lower() in (".xlsx", ".xls"):
-        return pd.read_excel(path)
+def read_input(fname):
+    if fname.lower().endswith(".csv"):
+        return pd.read_csv(fname)
+    elif fname.lower().endswith((".xlsx", ".xls")):
+        return pd.read_excel(fname)
     else:
         raise ValueError("Input file must be .csv or .xlsx")
 
-# =========================
+
+def parse_line(val):
+    """
+    Parse wavelength column.
+    Accepts:
+        457.1
+        "457.1"
+        "457.1 nm"
+    """
+    if pd.isna(val):
+        return np.nan
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).lower().replace("nm", "").strip()
+    return float(s)
+
+
+# ---------------------------------------------------------
 # Main
-# =========================
+# ---------------------------------------------------------
+
 def main(infile, outfile):
-    infile = Path(infile)
-    outfile = Path(outfile)
 
     df = read_input(infile)
-    df.columns = df.columns.str.strip()
 
-    required = {"Teff", "logg", "A(Mg)", "vmic", "line"}
-    missing = required - set(df.columns)
+    required = ["Teff", "logg", "A(Mg)", "vmic", "line"]
+    missing = [c for c in required if c not in df.columns]
     if missing:
-        raise KeyError(f"Missing required columns: {missing}")
+        raise ValueError(f"Missing required columns: {missing}")
 
-    # Parse wavelength and drop invalid rows
-    df["lambda_air"] = df["line"].apply(parse_nm)
-    n_before = len(df)
-    df = df.dropna(subset=["lambda_air"]).reset_index(drop=True)
-    n_after = len(df)
+    # Parse wavelength column
+    df["lambda_air"] = df["line"].map(parse_line).round(1)
 
-    if n_after < n_before:
-        print(f"Dropped {n_before - n_after} rows with invalid line values")
+    # Drop unsupported lines
+    mask_supported = np.isin(df["lambda_air"], SUPPORTED_LINES)
+
+    if not mask_supported.all():
+        dropped = np.sort(df.loc[~mask_supported, "lambda_air"].unique())
+        print(f"Warning: dropping unsupported Mg I lines (nm): {dropped}")
+
+    df = df.loc[mask_supported].reset_index(drop=True)
 
     if df.empty:
-        raise RuntimeError("No valid rows remaining after parsing 'line' column.")
+        raise ValueError("No supported Mg I lines left after filtering.")
 
-    # =========================
-    # Model selection
-    # =========================
-    if np.all(np.abs(df["lambda_air"] - 457.1) < 0.2):
-        # Dedicated 457.1 nm model
-        model = joblib.load(MODEL_457)
-        X = df[["Teff", "logg", "A(Mg)", "vmic"]].astype(float)
+    # Prepare output column
+    df["aberr"] = np.nan
 
-    else:
-        # Unified multiline model
-        model = joblib.load(MODEL_UNIFIED)
+    # Load models
+    model_457 = joblib.load(MODEL_457)
+    model_unified = joblib.load(MODEL_UNIFIED)
 
-        phys = df["lambda_air"].round(1).map(LINE_PHYSICS)
-        if phys.isna().any():
-            bad = df.loc[phys.isna(), "lambda_air"].unique()
-            raise ValueError(f"No line physics defined for wavelengths: {bad}")
+    # Features used by ML models
+    Xcols = ["Teff", "logg", "A(Mg)", "vmic"]
 
-        phys_df = pd.DataFrame(list(phys))
+    # 457.1 nm (dedicated model)
+    mask_457 = df["lambda_air"] == 457.1
+    if mask_457.any():
+        X = df.loc[mask_457, Xcols]
+        df.loc[mask_457, "aberr"] = model_457.predict(X)
 
-        lam_air = df["lambda_air"].values
-        lam_vac = lam_air * n_air_ciddor(lam_air)
-        deltaE_eV = HC_eVnm / lam_vac
-        eup_eV = phys_df["elo_eV"].values + deltaE_eV
+    # Other supported lines (unified model)
+    mask_other = ~mask_457
+    if mask_other.any():
+        X = df.loc[mask_other, Xcols].copy()
+        X["lambda_air"] = df.loc[mask_other, "lambda_air"].values
+        df.loc[mask_other, "aberr"] = model_unified.predict(X)
 
-        X = pd.concat(
-            [
-                df[["Teff", "logg", "A(Mg)", "vmic"]].astype(float),
-                pd.DataFrame(
-                    {
-                        "lambda_air": lam_air,
-                        "lambda_vac": lam_vac,
-                        "deltaE_eV": deltaE_eV,
-                        "elo_eV": phys_df["elo_eV"],
-                        "eup_eV": eup_eV,
-                        "lggf": phys_df["lggf"],
-                        "log_gamma_rad": phys_df["log_gamma_rad"],
-                        "sigma": phys_df["sigma"],
-                        "alpha": phys_df["alpha"],
-                    }
-                ),
-            ],
-            axis=1,
-        )
+    # Save output
+    df.drop(columns=["lambda_air"]).to_csv(outfile, index=False)
+    print(f"Saved abundance corrections to {outfile}")
 
-    # =========================
-    # Prediction
-    # =========================
-    df["aberr"] = model.predict(X)
 
-    df.to_csv(outfile, index=False)
-    print(f"Saved output → {outfile}")
-
-# =========================
+# ---------------------------------------------------------
 if __name__ == "__main__":
     if len(sys.argv) != 3:
-        print("Usage: python3 main_mg_aberr.py input.(csv|xlsx) output.csv")
+        print("Usage: python3 main_mg_aberr.py input_file output_file")
         sys.exit(1)
 
     main(sys.argv[1], sys.argv[2])
