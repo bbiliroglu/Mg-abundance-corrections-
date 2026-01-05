@@ -27,7 +27,7 @@ MODEL_UNIFIED = os.path.join(MODELS_DIR, "unified_mlp_pipeline.joblib")
 
 
 # --------------------------------------------------
-# Line-physics table (INTERNAL)
+# Line physics (INTERNAL — DO NOT REQUIRE USER INPUT)
 # --------------------------------------------------
 
 LINE_PHYSICS = {
@@ -86,49 +86,56 @@ def main(infile, outfile):
         if c not in df.columns:
             raise ValueError(f"Missing required column: {c}")
 
+    # Parse wavelength
     df["lambda_air"] = df["line"].map(parse_line).round(1)
 
-    # Prepare output
+    # Prepare output column
     df["aberr"] = np.nan
 
     # Load models
     model_457 = joblib.load(MODEL_457)
     model_uni = joblib.load(MODEL_UNIFIED)
 
-    # -------------------------
-    # 457.1 nm
-    # -------------------------
+    # --------------------------------------------------
+    # 457.1 nm dedicated model
+    # --------------------------------------------------
+
     mask_457 = df["lambda_air"] == 457.1
     if mask_457.any():
-        X = df.loc[mask_457, ["Teff", "logg", "A(Mg)", "vmic"]]
-        df.loc[mask_457, "aberr"] = model_457.predict(X)
+        X457 = df.loc[mask_457, ["Teff", "logg", "A(Mg)", "vmic"]]
+        df.loc[mask_457, "aberr"] = model_457.predict(X457)
 
-    # -------------------------
+    # --------------------------------------------------
     # Unified model
-    # -------------------------
+    # --------------------------------------------------
+
     mask_uni = df["lambda_air"].isin(LINE_PHYSICS.keys())
     mask_uni &= ~mask_457
 
     if mask_uni.any():
         rows = df.loc[mask_uni].copy()
 
+        # Inject line physics
         for col in ["lambda_vac", "elo_eV", "eup_eV", "deltaE_eV",
                     "lggf", "log_gamma_rad", "sigma", "alpha"]:
             rows[col] = rows["lambda_air"].map(
                 lambda l: LINE_PHYSICS[l][col]
             )
 
-        X = rows[[
+        # IMPORTANT: lambda_air MUST be included
+        Xuni = rows[[
             "Teff", "logg", "A(Mg)", "vmic",
-            "lambda_vac", "elo_eV", "eup_eV", "deltaE_eV",
+            "lambda_air", "lambda_vac",
+            "elo_eV", "eup_eV", "deltaE_eV",
             "lggf", "log_gamma_rad", "sigma", "alpha"
         ]]
 
-        df.loc[mask_uni, "aberr"] = model_uni.predict(X)
+        df.loc[mask_uni, "aberr"] = model_uni.predict(Xuni)
 
-    # -------------------------
-    # Warn & drop unsupported
-    # -------------------------
+    # --------------------------------------------------
+    # Drop unsupported lines
+    # --------------------------------------------------
+
     unsupported = df["aberr"].isna()
     if unsupported.any():
         bad = np.sort(df.loc[unsupported, "lambda_air"].unique())
